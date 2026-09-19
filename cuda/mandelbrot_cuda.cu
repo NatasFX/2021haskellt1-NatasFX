@@ -7,7 +7,8 @@ namespace {
 constexpr int paletteLength = 2032;
 
 __device__ void writeColour(unsigned char *pixels, const unsigned char *palette,
-                            int output, int iter, int iterations, double mag2, int hue) {
+                            int output, int iter, int iterations, double mag2,
+                            double zoom, int hue) {
   if (iter == iterations) {
     pixels[output] = pixels[output + 1] = pixels[output + 2] = 0;
     return;
@@ -15,7 +16,11 @@ __device__ void writeColour(unsigned char *pixels, const unsigned char *palette,
   const double logTwo = log(2.0);
   const double magnitude = sqrt(mag2);
   const double inner = log(magnitude) / logTwo;
-  const int rawPhase = int(sqrt(double(iter) + 1.0 - log(inner) / logTwo) * 200.0
+  // Match the CPU's zoom-compensated smooth colouring.  The initial frame is
+  // 2^7, so its palette phase is unchanged.
+  const double smoothIter = double(iter) + 1.0 - log(inner) / logTwo;
+  const double zoomColourOffset = fmax(0.0, log(zoom) / logTwo - 7.0);
+  const int rawPhase = int(sqrt(fmax(0.0, smoothIter - zoomColourOffset)) * 200.0
                            + double(hue) * 4.0 - 150.0);
   int phase = rawPhase % 2048;
   if (phase < 0) phase += 2048;
@@ -43,7 +48,7 @@ __global__ void renderKernel(unsigned char *pixels, const unsigned char *palette
     ++iter;
   }
   const int output = (y * width + x) * 3;
-  writeColour(pixels, palette, output, iter, iterations, mag2, hue);
+  writeColour(pixels, palette, output, iter, iterations, mag2, zoom, hue);
 }
 
 __global__ void renderDeepKernel(unsigned char *pixels, const unsigned char *palette,
@@ -79,7 +84,7 @@ __global__ void renderDeepKernel(unsigned char *pixels, const unsigned char *pal
     ++iter;
     if (mag2 >= 16.0 || !isfinite(mag2)) break;
   }
-  writeColour(pixels, palette, (y * width + x) * 3, iter, iterations, mag2, hue);
+  writeColour(pixels, palette, (y * width + x) * 3, iter, iterations, mag2, zoom, hue);
 }
 }
 

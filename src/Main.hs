@@ -143,14 +143,19 @@ calcPoint iterations (cx,cy) (!zx,!zy) !iter
     !magnitudeSquared = zx*zx + zy*zy
     !nextZ = (zx*zx - zy*zy + cx, 2*zx*zy + cy)
 
-colorFromIter :: Int -> Int -> (Int, Double) -> PixelRGB8
-colorFromIter iterations hue iterPoint
+colorFromIter :: Int -> Int -> Double -> (Int, Double) -> PixelRGB8
+colorFromIter iterations hue zoom iterPoint
   | iter == iterations = PixelRGB8 0 0 0
   | otherwise = PixelRGB8 (palleteR!i) (palleteG!i) (palleteB!i)
   where (iter,mag) = iterPoint
         i = mod (truncate (color * toFloat maxi)) maxi
         color = toFloat ix / toFloat points -- Entre 0 e 1, representa um ciclo de cores
-        ix = truncate (sqrt (toFloat iter + 1 - logBase 2 (logBase 2 mag))*200 + toFloat hue*4 + toFloat hueOffset ) `mod` points
+        -- Smooth escape counts gain roughly log2(zoom) under magnification.
+        -- Remove that global offset so zooming does not spin the palette on
+        -- its own; hue remains the only intentional temporal colour motion.
+        ix = truncate (sqrt (max 0 (smoothIter - zoomColourOffset))*200 + toFloat hue*4 + toFloat hueOffset ) `mod` points
+        smoothIter = toFloat iter + 1 - logBase 2 (logBase 2 mag)
+        zoomColourOffset = max 0 (logBase 2 zoom - 7)
         points = 2048
 
 genIter :: Int -> Int -> Int -> Int -> Int -> (Int, Double)
@@ -205,12 +210,13 @@ doAnim info static
       cudaImage <- generateImageDeepCuda iterations zoom hue (deepFrame width height iterations zoom coordXText coordYText)
       maybe (generateImageParallel genPixel width height) pure cudaImage
   | otherwise = generateImageParallel genPixel width height
-  where genPixel x y = colorFromIter iterations hue $ if static then (readIter x y, readMag x y) else renderPoint x y
+  where genPixel x y = colorFromIter iterations hue colourZoom $ if static then (readIter x y, readMag x y) else renderPoint x y
         h = hueDB `div` (10*sensitivity)
         hue = mod (db `div` (20*sensitivity) + h + frameN `div` 60) maxi
         (path, frameN, db) = (genPath $ fst s, fromIntegral $ fst s, snd s)
         (s, hueDB) = info
         zoom = zoomFor frameN hueDB
+        colourZoom = if static then 2 ** fixedZoom else zoom
         iterations = if static then maxIter else iterationsFor zoom
         deep = if zoom >= deepZoomThreshold then Just (deepFrame width height iterations zoom coordXText coordYText) else Nothing
         renderPoint x y = maybe (genIter iterations x y frameN hueDB) (\frame -> deepPoint frame x y) deep
