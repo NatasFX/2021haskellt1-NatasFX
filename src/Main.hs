@@ -204,12 +204,14 @@ doAnim info static
       maybe (generateImageParallel genPixel width height) pure cudaImage
   | otherwise = generateImageParallel genPixel width height
   where genPixel x y = colorFromIter iterations hue $ if static then (readIter x y, readMag x y) else renderPoint x y
-        -- 'hueDB' is intentionally the accumulated bass that drives zoom.
-        -- Do not feed it back into the palette: that made its colour response
-        -- appear stronger later in the same (deeper) animation.  Palette
-        -- movement now depends only on the current normalized bass and time.
-        hue = mod (db `div` (20*sensitivity) + frameN `div` 60) maxi
-        (path, frameN, db) = (genPath $ fst s, fromIntegral $ fst s, snd s)
+        -- The palette needs a phase accumulator: using only the current FFT
+        -- value makes it snap back every frame instead of cycling.  'hueDB'
+        -- is accumulated from the normalized audio envelope, so its delta is
+        -- determined by the beat alone.  In particular, do not include
+        -- 'zoom' (or its exponent) here: a beat then has the same colour
+        -- response at every zoom level.
+        hue = mod (hueDB `div` (10*sensitivity) + frameN `div` 60) maxi
+        (path, frameN, _db) = (genPath $ fst s, fromIntegral $ fst s, snd s)
         (s, hueDB) = info
         zoom = zoomFor frameN hueDB
         iterations = if static then maxIter else iterationsFor zoom
