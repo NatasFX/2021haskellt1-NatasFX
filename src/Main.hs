@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 {-
   Programa em haskell para gerar Mandelbrot
   Trabalho 1 de Paradigmas de Programação
@@ -11,13 +13,22 @@ import Codec.FFmpeg.Encode
 import System.IO
 import System.Exit ( exitFailure, exitSuccess )
 import Data.WAVE
-import Math.FFT ( dftRC )
 import Data.Array.CArray
 import qualified Data.Array.IArray
 import Data.Complex
 import Data.Maybe ( fromMaybe )
 import Data.Char ( toLower )
 import System.Process ( shell, callCommand )
+import DeepZoom ( DeepFrame, deepFrame, deepPoint, deepReferenceOrbit )
+import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Storable.Mutable as VSM
+import Control.Concurrent ( MVar, forkOn, newEmptyMVar, putMVar, takeMVar )
+import Control.Exception ( AsyncException(UserInterrupt), SomeException, catch, mask, throwIO, try )
+import Control.Monad ( forM, forM_, when )
+import Data.IORef ( atomicModifyIORef', newIORef )
+import GHC.Conc ( getNumCapabilities )
+import AudioTiming ( getAnimationTimings )
+import CudaRender ( cudaRenderDeepFrame, cudaRenderFrame )
 
 
 type CComplex = (Double, Double)
@@ -28,25 +39,35 @@ type CComplex = (Double, Double)
 -----------------------------------------------------------
 musicPath, videoPath, imagesPath :: FilePath
 width, height, maxIter, hueOffset, sensitivity, dropped :: Int
+bassTarget :: Int
 coordY, coordX, maxZoom, framerate, fixedZoom :: Double
+coordXText, coordYText :: String
 
 musicPath = "./mandeloso.wav"
-videoPath = "./mandelbrot.mp4"
+-- Matroska is streamable while FFmpeg is still receiving frames; unlike MP4,
+-- it does not need a final index before VLC/mpv can begin playback.
+videoPath = "./mandelbrot.mkv"
 imagesPath = "./anim/%d.png"
 
 width = 1920          -- largura
 height = 1080        -- altura
-maxIter = 90        -- numero maximo de iterações
+maxIter = 64        -- Zoom raso não precisa do orçamento de um deep zoom.
 hueOffset = -150       -- caso queira que a cor inicial seja diferente 
 
-maxZoom = 1.6519276269095182e16     --Zoom maximo suportado
+maxZoom = 1.0e300     -- O deep zoom usa orbita de referencia; Double deixa de limitar o centro.
 
-coordX =  0.36024044343761436323612524444954530848260780795858575048837581474019534605  -- Coordenadas X
-coordY = -0.64131306106480317486037501517930206657949495228230525955617754306444857417  -- Coordenadas Y
+coordXText = "0.36024044343761436323612524444954530848260780795858575048837581474019534605"
+coordYText = "-0.64131306106480317486037501517930206657949495228230525955617754306444857417"
+coordX = read coordXText  -- Caminho Double para zooms rasos.
+coordY = read coordYText
 
 framerate = 60        -- Framerate do vídeo
 
 sensitivity = 20      -- Sensibilidade ao grave maior = menos sensível
+
+-- O percentil 95% do grave é mapeado para este valor; picos acima dele são
+-- limitados antes de alimentar a resposta acumulativa de zoom e paleta.
+bassTarget = 40000
 
 estático :: Bool
 estático = False       -- Quando True ele não fará zoom e se manterá estático em fixedZoom
@@ -114,15 +135,17 @@ maxi = length laranja*2 + length verde*2 + length azul*2 + length roxo*2
 -----------------------------------------------------------
 -- Cálculo do Mandelbrot
 -----------------------------------------------------------
-calcPoint :: CComplex -> CComplex -> Int -> (Int, Double)
-calcPoint (cx,cy) (zx,zy) iter
-  | iter < maxIter && sqrt(zx^2 + zy^2) < 4 = calcPoint (cx,cy) newZ (iter+1)
-  | otherwise = (iter, magnitude (zx:+zy) )
-  where newZ = (zx^2 - zy^2 + cx , 2*zx*zy + cy)
+calcPoint :: Int -> CComplex -> CComplex -> Int -> (Int, Double)
+calcPoint iterations (cx,cy) (!zx,!zy) !iter
+  | iter < iterations && magnitudeSquared < 16 = calcPoint iterations (cx,cy) nextZ (iter+1)
+  | otherwise = (iter, sqrt magnitudeSquared)
+  where
+    !magnitudeSquared = zx*zx + zy*zy
+    !nextZ = (zx*zx - zy*zy + cx, 2*zx*zy + cy)
 
-colorFromIter :: Int -> (Int, Double) -> PixelRGB8
-colorFromIter hue iterPoint
-  | iter == maxIter = PixelRGB8 0 0 0
+colorFromIter :: Int -> Int -> (Int, Double) -> PixelRGB8
+colorFromIter iterations hue iterPoint
+  | iter == iterations = PixelRGB8 0 0 0
   | otherwise = PixelRGB8 (palleteR!i) (palleteG!i) (palleteB!i)
   where (iter,mag) = iterPoint
         i = mod (truncate (color * toFloat maxi)) maxi
@@ -130,23 +153,18 @@ colorFromIter hue iterPoint
         ix = truncate (sqrt (toFloat iter + 1 - logBase 2 (logBase 2 mag))*200 + toFloat hue*4 + toFloat hueOffset ) `mod` points
         points = 2048
 
-genIter :: Int -> Int -> Int -> Int -> (Int, Double)
-genIter  x y frame db = calcPoint (xPos, yPos) (0,0) 0
+genIter :: Int -> Int -> Int -> Int -> Int -> (Int, Double)
+genIter iterations x y frame db = calcPoint iterations (xPos, yPos) (0,0) 0
   where xPos = (x'-w/2)/size+coordX
         yPos = (y'-h/2)/size+coordY
         (w, h) = (fromIntegral width, fromIntegral height)
         (x', y') = (fromIntegral x, fromIntegral y)
-        size = 2** if frame == -1 then fixedZoom else exponent
-        exponent = if exp > maxZoom then maxZoom else exp
-        exp = fromIntegral (frame + db `div` 160)/(framerate*10)+7
+        size = if frame == -1 then 2 ** fixedZoom else zoomFor frame db
 
 
 -----------------------------------------------------------
 -- Funções de matrizes/vetores
 -----------------------------------------------------------
-carray :: [Double] -> CArray (Int, Int) Double
-carray = listArray ((0, 0), (1024,0))
-
 cMatrix :: [Int] -> CArray (Int, Int) Int
 cMatrix = listArray ((0, 0), (width,height))
 
@@ -154,10 +172,10 @@ cMatrixDouble :: [Double] -> CArray (Int, Int) Double
 cMatrixDouble = listArray ((0, 0), (width,height))
 
 matrixIter :: CArray (Int, Int) Int
-matrixIter = cMatrix [fst $ genIter x y (-1) 0 | x <- [0..width], y <- [0..height]]
+matrixIter = cMatrix [fst $ genIter maxIter x y (-1) 0 | x <- [0..width], y <- [0..height]]
 
 matrixMag :: CArray (Int, Int) Double
-matrixMag = cMatrixDouble [snd $ genIter x y (-1) 0 | x <- [0..width], y <- [0..height]]
+matrixMag = cMatrixDouble [snd $ genIter maxIter x y (-1) 0 | x <- [0..width], y <- [0..height]]
 
 readIter :: Int -> Int -> Int
 readIter x y = matrixIter ! (x,y)
@@ -168,49 +186,123 @@ readMag x y = matrixMag ! (x,y)
 palVec :: [Pixel8] -> CArray Int Pixel8
 palVec = listArray (0,maxi)
 
+cudaPalette :: VS.Vector Pixel8
+cudaPalette = VS.fromList [component | (red, green, blue) <- pallete, component <- [red, green, blue]]
+
 
 -----------------------------------------------------------
 -- Funções FFT
 -----------------------------------------------------------
-cleanComplex :: CArray (Int,Int) (Complex Double) -> Int
-cleanComplex c = sum stripped `div` 10
-  where stripped = take 7 cleaned
-        cleaned = map (\comp -> round (magnitude comp) `div` 100)  $ elems c
-
-getAnimationTimings :: [Double] -> [Int] -> Int -> Int -> [((Int, Int), Int)]
-getAnimationTimings samples rangeFrames spf dur = map (\(sz, db) -> ((sz, db), foldl1 (\n x -> n + x `div` 15) $ take sz [snd t | t <- newSt])) newSt
-  where st = map (\x -> cleanComplex $ dftRC $ carray $ drop (spf*x+1) samples) rangeFrames
-        newSt = map (\sz -> (sz, foldl1 (\n x -> n - (n-x) `div` 4) $ take sz st)) [2..dur * round framerate]
-
-
 -----------------------------------------------------------
 -- Criação da imagem
 -----------------------------------------------------------
-doAnim :: ((Int, Int),Int) -> Bool -> Maybe (Image PixelRGB8)
-doAnim info static = Just $ generateImage genPixel width height
-  where genPixel x y = colorFromIter hue $ if static then (readIter x y, readMag x y) else genIter x y frameN hueDB
+doAnim :: ((Int, Int),Int) -> Bool -> IO (Image PixelRGB8)
+doAnim info static
+  | not static && zoom < deepZoomThreshold = do
+      cudaImage <- generateImageCuda iterations zoom hue
+      maybe (generateImageParallel genPixel width height) pure cudaImage
+  | not static = do
+      cudaImage <- generateImageDeepCuda iterations zoom hue (deepFrame width height iterations zoom coordXText coordYText)
+      maybe (generateImageParallel genPixel width height) pure cudaImage
+  | otherwise = generateImageParallel genPixel width height
+  where genPixel x y = colorFromIter iterations hue $ if static then (readIter x y, readMag x y) else renderPoint x y
         h = hueDB `div` (10*sensitivity)
         hue = mod (db `div` (20*sensitivity) + h + frameN `div` 60) maxi
         (path, frameN, db) = (genPath $ fst s, fromIntegral $ fst s, snd s)
         (s, hueDB) = info
+        zoom = zoomFor frameN hueDB
+        iterations = if static then maxIter else iterationsFor zoom
+        deep = if zoom >= deepZoomThreshold then Just (deepFrame width height iterations zoom coordXText coordYText) else Nothing
+        renderPoint x y = maybe (genIter iterations x y frameN hueDB) (\frame -> deepPoint frame x y) deep
+
+deepZoomThreshold :: Double
+deepZoomThreshold = 1.0e12
+
+zoomFor :: Int -> Int -> Double
+zoomFor frame db = min maxZoom (2 ** zoomExponent frame db)
+
+zoomExponent :: Int -> Int -> Double
+zoomExponent frame db = fromIntegral (frame + db `div` 160)/(framerate*10)+7
+
+-- More detail becomes visible as the viewport narrows.  The cap keeps deep
+-- zoom usable while still allowing complex boundary regions to converge.
+iterationsFor :: Double -> Int
+iterationsFor zoom = min 4096 (maxIter + 64 * max 0 (floor (logBase 2 zoom) - 7))
+
+-- | Rendering a row is independent from every other row.  The strategy makes
+-- each row fully strict before the image is encoded, allowing the RTS to use
+-- every capability requested with @+RTS -N@ while retaining bounded frame
+-- memory.
+generateImageParallel :: (Int -> Int -> PixelRGB8) -> Int -> Int -> IO (Image PixelRGB8)
+generateImageParallel pixel imageWidth imageHeight = do
+  pixels <- VSM.unsafeNew (imageWidth * imageHeight * 3)
+  nextRow <- newIORef 0
+  capabilities <- getNumCapabilities
+  completed <- forM [0..min imageHeight capabilities - 1] $ \capability -> do
+    done <- newEmptyMVar :: IO (MVar (Either SomeException ()))
+    _ <- forkOn capability $ do
+      result <- try (renderRows pixels nextRow)
+      putMVar done result
+    pure done
+  results <- mapM takeMVar completed
+  mapM_ (either throwIO pure) results
+  Image imageWidth imageHeight <$> VS.unsafeFreeze pixels
+  where
+    renderRows pixels nextRow = do
+      row <- atomicModifyIORef' nextRow (\current -> (current + 1, current))
+      when (row < imageHeight) $ do
+        forM_ [0..imageWidth - 1] $ \column ->
+          case pixel column row of
+            PixelRGB8 red green blue -> do
+              let offset = (row * imageWidth + column) * 3
+              VSM.unsafeWrite pixels offset red
+              VSM.unsafeWrite pixels (offset + 1) green
+              VSM.unsafeWrite pixels (offset + 2) blue
+        renderRows pixels nextRow
+
+-- CUDA uses Double for ordinary frames. Deep frames retain the CPU
+-- perturbation renderer because their reference orbit uses arbitrary precision.
+generateImageCuda :: Int -> Double -> Int -> IO (Maybe (Image PixelRGB8))
+generateImageCuda iterations zoom hue = do
+  pixels <- VSM.unsafeNew (width * height * 3)
+  rendered <- cudaRenderFrame pixels cudaPalette width height iterations zoom coordX coordY hue
+  if rendered
+    then Just . Image width height <$> VS.unsafeFreeze pixels
+    else pure Nothing
+
+generateImageDeepCuda :: Int -> Double -> Int -> DeepFrame -> IO (Maybe (Image PixelRGB8))
+generateImageDeepCuda iterations zoom hue frame = do
+  pixels <- VSM.unsafeNew (width * height * 3)
+  rendered <- cudaRenderDeepFrame pixels cudaPalette (deepReferenceOrbit frame) width height iterations zoom hue
+  if rendered
+    then Just . Image width height <$> VS.unsafeFreeze pixels
+    else pure Nothing
 
 doAnimSave :: ((Int, Int),Int) -> FilePath -> Bool -> IO ()
 doAnimSave info path static = do
-
-  let image = fromMaybe (generateImage (\x y -> PixelRGB8 0 0 0) 2 2 ) $ doAnim info static
-
-  if imageWidth image < 3 then putStrLn "" else writePng path image
+  image <- doAnim info static
+  writePng path image
 
 
 writeVideo :: [((Int, Int), Int)] -> Int -> Int -> Int ->  IO ()
-writeVideo dbList spf sr total = do
-  let listOfImage = map (`doAnim` estático) dbList ++ [Nothing]
-
+writeVideo dbList spf sr total = mask $ \restore -> do
   save <- imageWriter (EncodingParams (fromIntegral width) (fromIntegral height) (round framerate) Nothing Nothing "medium" Nothing) videoPath
+  let renderFrames =
+        mapM_ (\(n, info) -> do
+          status total n
+          image <- doAnim info estático
+          save (Just image)
+        ) (zip [1..] dbList)
 
-  mapM_ (\(n,z) -> status total n >> save z) $ zip [1..] listOfImage
+  interrupted <- (restore renderFrames >> pure False) `catch` \UserInterrupt -> do
+    putStrLn "\nInterrupção recebida; finalizando o vídeo parcial..."
+    pure True
 
-  callCommand $ printf "ffmpeg -i %s -i %s -map 0:v -map 1:a -c:v copy -shortest %s -y" videoPath musicPath ( reverse (drop 4 $ reverse videoPath) ++ "_audio.mp4")
+  -- Keep this masked: a second Ctrl+C cannot interrupt FFmpeg while it writes
+  -- the MP4 trailer, which is what makes a partial render playable.
+  save Nothing
+  callCommand $ printf "ffmpeg -i %s -i %s -map 0:v -map 1:a -c:v copy -shortest %s -y" videoPath musicPath "./mandelbrot_audio.mkv"
+  when interrupted $ putStrLn "Vídeo parcial finalizado com áudio."
 
 
 -----------------------------------------------------------
@@ -224,10 +316,9 @@ main = do
 
   let header = waveHeader p
 
-  -- Esse número 32768 é quando estamos lendo word8 signed como unsigned
-  -- então o que deveria ser 0 signed se torna 32768 unsigned (10000000 = -32768 signed but 10000000 unsiged = 32768)
-  -- o FFT não se importa mt, math is beautiful
-  let waveSmpAll = [fromIntegral (head l) /32768 | l <- waveSamples p] --todas nossas samples
+  -- WAVE armazena o PCM signed como unsigned; recentrar remove o componente
+  -- DC antes da FFT e deixa a normalização de graves consistente.
+  let waveSmpAll = [(fromIntegral (head l) - 32768) / 32768 | l <- waveSamples p]
 
   let sampleRate = waveFrameRate header  --Numero de samples e.g 44100
 
@@ -255,7 +346,7 @@ main = do
      [((a, b), c)] onde a é o numero do frame
      b é quantidade de grave que o fft disse que tem no frame atual
      c é a versão suavizada de b, objetivo dela é não ter picos extremos -}
-  let dbList = drop dropped $ getAnimationTimings waveSmp rangeFrames samplesPerFrame duração
+  let dbList = drop dropped $ getAnimationTimings bassTarget waveSmp rangeFrames samplesPerFrame duração
 
   _ <- putStr "Deseja salvar em vídeo? [Y/N] "
   opt <- getLine
