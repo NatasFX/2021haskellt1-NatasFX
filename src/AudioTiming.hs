@@ -4,6 +4,7 @@
 -- equivalent to 'legacyAnimationTimings', retained for characterization tests.
 module AudioTiming
   ( getAnimationTimings
+  , getAnimationTimingsAt
   , legacyAnimationTimings
   ) where
 
@@ -38,12 +39,19 @@ normalizeBass target values
 -- and both envelope stages are strict incremental scans.
 getAnimationTimings :: Int -> [Double] -> [Int] -> Int -> Int -> [((Int, Int), Int)]
 getAnimationTimings bassTarget samples rangeFrames samplesPerFrame duration =
+  getAnimationTimingsAt bassTarget samples rangeFrames (\frame -> samplesPerFrame * frame + 1) duration
+
+-- | Variant with an exact frame-to-sample clock.  A rounded integer number of
+-- samples per frame drifts whenever sampleRate is not divisible by FPS (for
+-- example 44,100 / 144 = 306.25).
+getAnimationTimingsAt :: Int -> [Double] -> [Int] -> (Int -> Int) -> Int -> [((Int, Int), Int)]
+getAnimationTimingsAt bassTarget samples rangeFrames sampleOffset duration =
   zipWith (\(frame, bass) hue -> ((frame, bass), hue)) frameBass hueValues
   where
     sampleVector = V.fromList samples
     bassValues = normalizeBass bassTarget (map bassAt rangeFrames)
     bassAt frame =
-      cleanComplex . dftRC . carray $ windowAt sampleVector (samplesPerFrame * frame + 1)
+      cleanComplex . dftRC . carray $ windowAt sampleVector (sampleOffset frame)
 
     frameNumbers = [2..last rangeFrames]
     smooth previous current = previous - (previous - current) `div` 4

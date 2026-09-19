@@ -27,7 +27,7 @@ import Control.Exception ( AsyncException(UserInterrupt), SomeException, catch, 
 import Control.Monad ( forM, forM_, when )
 import Data.IORef ( atomicModifyIORef', newIORef )
 import GHC.Conc ( getNumCapabilities )
-import AudioTiming ( getAnimationTimings )
+import AudioTiming ( getAnimationTimingsAt )
 import CudaRender ( cudaRenderDeepFrame, cudaRenderFrame )
 
 
@@ -331,11 +331,21 @@ main = do
 
   _ <- if samples == 0 then exitFalha "Falha na leitura de samples do arquivo." else putStrLn "\nFile OK."
 
+  let framesPerSecond = round framerate
+
+  -- Ceiling ensures the image stream covers the fractional final second of
+  -- the audio; FFmpeg's -shortest then trims the final frame precisely.
+  let frameCount = (samples * framesPerSecond + sampleRate - 1) `div` sampleRate
+
+  -- 'total' is also the final logical frame index.  AudioTiming emits frames
+  -- 2..total, therefore this yields exactly frameCount encoded frames.
+  let total = frameCount + 1
+
   let duração = samples `div` waveFrameRate header
 
-  let samplesPerFrame = sampleRate `div` round framerate
-
-  let total = duração * round framerate
+  -- Compute every frame's position from its timestamp, not from a truncated
+  -- samples-per-frame value.  This avoids a linear A/V drift at 144 fps.
+  let sampleOffset frame = (frame * sampleRate + framesPerSecond `div` 2) `div` framesPerSecond + 1
 
   let rangeFrames = [0..total]
 
@@ -349,7 +359,7 @@ main = do
      [((a, b), c)] onde a é o numero do frame
      b é quantidade de grave que o fft disse que tem no frame atual
      c é a versão suavizada de b, objetivo dela é não ter picos extremos -}
-  let dbList = drop dropped $ getAnimationTimings bassTarget waveSmp rangeFrames samplesPerFrame duração
+  let dbList = drop dropped $ getAnimationTimingsAt bassTarget waveSmp rangeFrames sampleOffset duração
 
   _ <- putStr "Deseja salvar em vídeo? [Y/N] "
   opt <- getLine
@@ -362,6 +372,6 @@ main = do
   if 'n' == toLower (head opt)
     then mapM_ (\(n, x) -> status total n >> doAnimSave x (genPath n) estático) $ zip [dropped..] dbList
 
-    else writeVideo dbList samplesPerFrame sampleRate total
+    else writeVideo dbList 0 sampleRate total
 
   putStrLn "\nDone"
