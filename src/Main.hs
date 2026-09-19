@@ -8,17 +8,15 @@
 
 import Codec.Picture
 import Text.Printf ( printf )
-import Codec.FFmpeg.Juicy ( imageWriter )
-import Codec.FFmpeg.Encode
 import System.IO
-import System.Exit ( exitFailure, exitSuccess )
+import System.Exit ( ExitCode(..), exitFailure, exitSuccess )
 import Data.WAVE
 import Data.Array.CArray
 import qualified Data.Array.IArray
 import Data.Complex
 import Data.Maybe ( fromMaybe )
 import Data.Char ( toLower )
-import System.Process ( shell, callCommand )
+import System.Process ( StdStream(CreatePipe), callCommand, createProcess, proc, std_in, waitForProcess )
 import DeepZoom ( DeepFrame, deepFrame, deepPoint, deepReferenceOrbit )
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector.Storable.Mutable as VSM
@@ -287,14 +285,28 @@ doAnimSave info path static = do
   writePng path image
 
 
-writeVideo :: [((Int, Int), Int)] -> Int -> Int -> Int ->  IO ()
-writeVideo dbList spf sr total = mask $ \restore -> do
-  save <- imageWriter (EncodingParams (fromIntegral width) (fromIntegral height) (round framerate) Nothing Nothing "medium" Nothing) videoPath
+writeVideo :: [((Int, Int), Int)] -> Int -> IO ()
+writeVideo dbList total = mask $ \restore -> do
+  -- ffmpeg-light rounded 60 fps to 16 ms PTS steps, producing a 62.5 fps
+  -- MKV.  Feeding raw RGB to FFmpeg declares the rate as an exact rational
+  -- and keeps audio reactions locked to the encoded video timeline.
+  (Just videoInput, _, _, encoder) <- createProcess (proc "ffmpeg"
+    [ "-hide_banner", "-loglevel", "error", "-y"
+    , "-f", "rawvideo", "-pixel_format", "rgb24"
+    , "-video_size", printf "%dx%d" width height
+    , "-framerate", show (round framerate)
+    , "-i", "pipe:0", "-an", "-c:v", "libx264", "-preset", "medium"
+    , "-crf", "20", "-pix_fmt", "yuv420p", "-f", "matroska", videoPath
+    ]) { std_in = CreatePipe }
+  hSetBuffering videoInput NoBuffering
+  let save :: Image PixelRGB8 -> IO ()
+      save image = VS.unsafeWith (imageData image) $ \pixelPointer ->
+        hPutBuf videoInput pixelPointer (VS.length (imageData image))
   let renderFrames =
         mapM_ (\(n, info) -> do
           status total n
           image <- doAnim info estático
-          save (Just image)
+          save image
         ) (zip [1..] dbList)
 
   interrupted <- (restore renderFrames >> pure False) `catch` \UserInterrupt -> do
@@ -302,9 +314,13 @@ writeVideo dbList spf sr total = mask $ \restore -> do
     pure True
 
   -- Keep this masked: a second Ctrl+C cannot interrupt FFmpeg while it writes
-  -- the MP4 trailer, which is what makes a partial render playable.
-  save Nothing
-  callCommand $ printf "ffmpeg -i %s -i %s -map 0:v -map 1:a -c:v copy -shortest %s -y" videoPath musicPath "./mandelbrot_audio.mkv"
+  -- the Matroska trailer, which is what makes a partial render playable.
+  hClose videoInput
+  encoderResult <- waitForProcess encoder
+  case encoderResult of
+    ExitSuccess -> pure ()
+    ExitFailure code -> exitFalha ("FFmpeg terminou com código " ++ show code)
+  callCommand $ printf "ffmpeg -i %s -i %s -map 0:v -map 1:a -c:v copy -c:a copy -shortest %s -y" videoPath musicPath "./mandelbrot_audio.mkv"
   when interrupted $ putStrLn "Vídeo parcial finalizado com áudio."
 
 
@@ -372,6 +388,6 @@ main = do
   if 'n' == toLower (head opt)
     then mapM_ (\(n, x) -> status total n >> doAnimSave x (genPath n) estático) $ zip [dropped..] dbList
 
-    else writeVideo dbList 0 sampleRate total
+    else writeVideo dbList total
 
   putStrLn "\nDone"
