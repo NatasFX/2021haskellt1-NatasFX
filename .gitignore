@@ -9,3 +9,6 @@ dist*
 anim
 *.wav
 *.mp4
+*.mkv
+cuda/*.so
+cuda/mandelbrot_bench
