@@ -206,8 +206,11 @@ doAnim info static
       maybe (generateImageParallel genPixel width height) pure cudaImage
   | otherwise = generateImageParallel genPixel width height
   where genPixel x y = colorFromIter iterations hue $ if static then (readIter x y, readMag x y) else renderPoint x y
-        h = hueDB `div` (10*sensitivity)
-        hue = mod (db `div` (20*sensitivity) + h + frameN `div` 60) maxi
+        -- 'hueDB' is intentionally the accumulated bass that drives zoom.
+        -- Do not feed it back into the palette: that made its colour response
+        -- appear stronger later in the same (deeper) animation.  Palette
+        -- movement now depends only on the current normalized bass and time.
+        hue = mod (db `div` (20*sensitivity) + frameN `div` 60) maxi
         (path, frameN, db) = (genPath $ fst s, fromIntegral $ fst s, snd s)
         (s, hueDB) = info
         zoom = zoomFor frameN hueDB
