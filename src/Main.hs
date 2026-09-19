@@ -290,14 +290,17 @@ writeVideo dbList total = mask $ \restore -> do
   -- ffmpeg-light rounded 60 fps to 16 ms PTS steps, producing a 62.5 fps
   -- MKV.  Feeding raw RGB to FFmpeg declares the rate as an exact rational
   -- and keeps audio reactions locked to the encoded video timeline.
-  (Just videoInput, _, _, encoder) <- createProcess (proc "ffmpeg"
+  -- A terminal Ctrl+C is sent to the process group.  Keep FFmpeg in a new
+  -- session so the renderer can close stdin and let it write a valid Matroska
+  -- trailer instead of making it abort with exit code 255.
+  (Just videoInput, _, _, encoder) <- createProcess (proc "setsid" ("ffmpeg" :
     [ "-hide_banner", "-loglevel", "error", "-y"
     , "-f", "rawvideo", "-pixel_format", "rgb24"
     , "-video_size", printf "%dx%d" width height
     , "-framerate", show (round framerate)
     , "-i", "pipe:0", "-an", "-c:v", "libx264", "-preset", "medium"
     , "-crf", "20", "-pix_fmt", "yuv420p", "-f", "matroska", videoPath
-    ]) { std_in = CreatePipe }
+    ])) { std_in = CreatePipe }
   hSetBuffering videoInput NoBuffering
   let save :: Image PixelRGB8 -> IO ()
       save image = VS.unsafeWith (imageData image) $ \pixelPointer ->
